@@ -167,3 +167,4 @@ venv
 
 # Output files
 out.json
+*.parquet

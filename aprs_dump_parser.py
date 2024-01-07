@@ -5,10 +5,10 @@ from sys import argv
 import polars as pl
 import re
 
-aprs_regex = r"(?P<source>[A-Z0-9]+(?:-[0-9]+)?)>(?P<destination>[A-Z0-9]+(?:-[0-9]+)?)(?:,(?P<relay>[A-Z0-9]+(?:-[0-9]+)?)\*?(?:,WIDE[0-9](?:-[0-9])?\*?)*)*(?:,qA[OR])?(?:,(?P<igate>[A-Z0-9]+(?:-[0-9]+)?))?:(?P<msg>.*)"
+aprs_regex = r"(?P<source>[A-Z0-9]+(?:-[0-9]+)?)>(?P<destination>[A-Z0-9]+(?:-[0-9]+)?),*(?P<ssid_list>[A-Z0-9-,*]*),(?P<q_construct>qA[OR])(?:,(?P<igate>[A-Z0-9-]+)):(?P<msg>.*)"
 
 def parse(filename):
-    extraction = extract(fin=filename, format='json', store=True)
+    extraction = extract(fin=filename, store=True)
     for frame in extraction.frame:
         if 'TCP' in frame:
             yield(frame.info.time, frame['TCP'].packet.payload)
@@ -27,7 +27,9 @@ def main():
     packets = []
     for timestamp, aprs_str in parse(argv[1]):
         try:
-            result = aprs_prog.match(aprs_str.decode('utf-8'))
+            aprs_str = aprs_str.decode('utf-8')
+            # print(aprs_str, end='')
+            result = aprs_prog.match(aprs_str)
         except UnicodeDecodeError:
             pass
         if result is not None:
@@ -36,8 +38,9 @@ def main():
             packets.append(packet)
 
     # Create dataframe from data
-    df = pl.DataFrame(packets, schema=["timestamp", "source", "destination", "relay", "igate", "msg"])
-    print(df)
+    df = pl.DataFrame(packets, schema=["timestamp", "source", "destination", "ssid_list", "q_construct", "igate", "msg"])
+    df.write_parquet(argv[1].replace("pcap", "parquet"))
+    # print(df)
 
 if __name__ == "__main__":
     main()
