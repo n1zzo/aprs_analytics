@@ -1,0 +1,12 @@
+[aprsc]
+	host = "APRSC_HOSTNAME"
+	port = 14580
+    user = "USER"
+    password = "PASSWORD"
+
+[db]
+    host = "DB_HOSTNAME"
+    port = 5432
+    database = "DB_NAME"
+    user = "DB_USER"
+    password = "DB_PASSWORD"
