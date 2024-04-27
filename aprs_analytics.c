@@ -167,7 +167,7 @@ PGconn *open_db_conn(toml_table_t *conf) {
   }
 
   // This string defines the database to be opened
-  snprintf(conninfo, CONNINFO_LEN, "host=%s port=%d dbname=%s user=%s password=%s", db_host.u.s, db_port.u.s, db_database.u.s, db_user.u.s, db_password.u.s);
+  snprintf(conninfo, CONNINFO_LEN, "host=%s port=%d dbname=%s user=%s password=%s", db_host.u.s, db_port.u.i, db_database.u.s, db_user.u.s, db_password.u.s);
 
   /* Make a connection to the database */
   conn = PQconnectdb(conninfo);
