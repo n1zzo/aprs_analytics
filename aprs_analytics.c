@@ -179,12 +179,6 @@ PGconn *open_db_conn(toml_table_t *conf) {
     exit_nicely(conn);
   }
 
-  /*
-   * Should PQclear PGresult whenever it is no longer needed to avoid memory
-   * leaks
-   */
-  PQclear(res);
-
   free(db_host.u.s);
   free(db_database.u.s);
   free(db_user.u.s);
