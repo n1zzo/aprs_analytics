@@ -229,6 +229,8 @@ void parse_packet(char *buf, size_t len, PGconn *conn) {
 int main(int argc, char *argv[])
 {
   char buffer[BUFSIZ];
+  int n_read = 0;
+  int tot_read = 0;
 
   toml_table_t *conf = parse_settings();
 
@@ -244,17 +246,16 @@ int main(int argc, char *argv[])
   // Main loop for getting and parsing APRS packets
   while (1) {
     // Receive a chunk of data
-    size_t n_read = read(sockfd, buffer + n_read, BUFSIZ - n_read);
-    //puts(buffer);
+    n_read = read(sockfd, buffer + tot_read, BUFSIZ - tot_read);
+
     // For each line, process an APRS packet
-    size_t msg_start = 0;
-    for(int i = 0; i < n_read; i++) {
-      if (buffer[i] == '\n') {
-        parse_packet(buffer + msg_start, i - msg_start, conn);
-        msg_start = i + 1;
+    for(int i = 0; i < tot_read; i++) {
+      if (buffer[i] == '\n' || buffer[i] == '\r') {
+        buffer[i] = '\0';
+        parse_packet(buffer, i, conn);
+        tot_read = 0;
       }
     }
-    n_read = 0;
   }
 
   // Close FAP
