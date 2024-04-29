@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <libpq-fe.h>
+#include <threads.h>
+#include <time.h>
 #include "toml.h"
 
 #define AUTH_STR_LEN 256
