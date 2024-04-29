@@ -11,9 +11,9 @@
 #include <libpq-fe.h>
 #include "toml.h"
 
-#define AUTH_STR_LEN 128
-#define ERR_STR_LEN 128
-#define CONNINFO_LEN 128
+#define AUTH_STR_LEN 256
+#define ERR_STR_LEN 256
+#define CONNINFO_LEN 256
 
 static void error(const char* msg, const char* msg1)
 {
@@ -108,7 +108,7 @@ int open_aprsc_conn(toml_table_t *conf) {
 
   // Authenticate to aprsc
   char auth_str[AUTH_STR_LEN] = { 0 };
-  snprintf(auth_str, AUTH_STR_LEN, "user %s pass %s vers aprs_analytics 0.1 filter r/0/0/25000\n", aprsc_user.u.s, aprsc_password.u.s);
+  snprintf(auth_str, AUTH_STR_LEN, "user %s pass %s vers aprs_analytics0.1\n", aprsc_user.u.s, aprsc_password.u.s);
   size_t auth_str_len = strnlen(auth_str, AUTH_STR_LEN);
   write(sockfd, auth_str, auth_str_len);
   // Receive aprsc version
@@ -186,33 +186,70 @@ PGconn *open_db_conn(toml_table_t *conf) {
 
   return conn;
 }
-
+/*
 const char insert_station_cmd[] = "INSERT INTO stations (callsign) "
-                                  "VALUES($1::string) "
+                                  "SELECT ($1::varchar) "
                                   "WHERE NOT EXISTS (SELECT 1 "
                                                     "FROM stations "
-                                                    "WHERE callsign = $1::varchar));";
+                                                    "WHERE callsign = $1::varchar);";
+*/
+const char insert_station_cmd[] = "WITH input_data(callsing_in, latitude_in, longitude_in) AS ("
+          " SELECT $1::varchar, $2::real, $3::real"
+          "), "
+          "station_insert AS ("
+                                  " INSERT INTO stations (callsign, symbol) "
+                                  " VALUES ($1::varchar, $5::smallint)"
+                                  " ON CONFLICT DO NOTHING"
+          " returning stationid"
+          "), "
+          "position_insert AS ("
+          " INSERT INTO positions (ts_start, point, ts_stop, station_id)"
+                                  " SELECT NOW(), ST_MakePoint(s1.longitude_in, s1.latitude_in), NOW(), s2.stationid "
+                                  " FROM input_data s1, station_insert s2"
+          " returning gid"
+          ") "
+          "INSERT INTO payloads (station_id, message, ts_message, position_id)"
+                                  " SELECT s2.stationid, $4::varchar, NOW(), s3.gid "
+                                  " FROM input_data s1, station_insert s2, position_insert s3;";
 
 // Log an APRS packet into the DB
 void log_packet(fap_packet_t *packet, PGconn *conn) {
   // Log any station that sends a location packet
   if ( packet->src_callsign && packet->latitude && packet->longitude)
   {
-    printf("Got geo packet from %s <%lf,%lf>.\n",
+/*
+    printf("\nGot geo packet from %s <%lf,%lf>.\nSymb tbl %d code %d -> %d\n",
            packet->src_callsign,
            *(packet->latitude),
-           *(packet->longitude));
-    const char *paramValues[1] = { packet->src_callsign }; 
+           *(packet->longitude),
+           packet->symbol_table,
+           packet->symbol_code,
+           packet->symbol_table*256 + packet->symbol_code - 32768);
+*/
+    char packet_latitude[10];
+    snprintf(packet_latitude, 10, "%.5lf\n", *(packet->latitude));
+    char packet_longitude[10];
+    snprintf(packet_longitude, 10, "%.5lf\n", *(packet->longitude));
+    char packet_symbol[10];
+    snprintf(packet_symbol, 10, "%d\n", packet->symbol_table*256 + packet->symbol_code - 32768);
+
+    printf("packet_symbol = %s", packet_symbol);
+
+    const char *paramValues[5] = { packet->src_callsign, packet_latitude, packet_longitude, packet->comment, packet_symbol };
+
     int resultFormat = 0;
-    PGresult *res = PQexecParams(conn, insert_station_cmd, 1, NULL, paramValues, NULL, NULL, 0);
+
+    PGresult *res = PQexecParams(conn, insert_station_cmd, 5, NULL, paramValues, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
       printf("PQexecParames failed: %s\n", PQresultErrorMessage(res));
     }
+    // Should PQclear PGresult whenever it is no longer needed to avoid memory leaks
+    PQclear(res);
   }
 }
 
 // Parse APRS packet using libfap
-void parse_packet(char *buf, size_t len, PGconn *conn) {
+void parse_packet(char *buf, int len, PGconn *conn) {
   fap_packet_t* packet = fap_parseaprs(buf, len, 0);
   if ( packet->error_code )
   {
@@ -221,8 +258,9 @@ void parse_packet(char *buf, size_t len, PGconn *conn) {
     printf("Failed to parse packet (%.*s): %s\n", (int)(len - 1), buf, err_str);
   }
   else
+  {
     log_packet(packet, conn);
-  // Only select location packets
+  }
   fap_free(packet);
 }
 
@@ -247,12 +285,19 @@ int main(int argc, char *argv[])
   while (1) {
     // Receive a chunk of data
     n_read = read(sockfd, buffer + tot_read, BUFSIZ - tot_read);
+    tot_read += n_read;
 
     // For each line, process an APRS packet
     for(int i = 0; i < tot_read; i++) {
-      if (buffer[i] == '\n' || buffer[i] == '\r') {
+      if (buffer[i] == '\r' || buffer[i] == '\n') {
         buffer[i] = '\0';
-        parse_packet(buffer, i, conn);
+        printf("\nRCVD: %s", buffer);
+        if (buffer[0] == '#')
+        {
+          tot_read = 0;
+          continue;
+        }
+        parse_packet(buffer, i+1, conn);
         tot_read = 0;
       }
     }
