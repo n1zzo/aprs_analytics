@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <libpq-fe.h>
 #include <threads.h>
@@ -19,8 +20,83 @@
 
 static void error(const char* msg, const char* msg1)
 {
-    fprintf(stderr, "Error: %s%s\n", msg, msg1?msg1:"");
-    exit(1);
+  fprintf(stderr, "Error: %s%s\n", msg, msg1?msg1:"");
+  exit(1);
+}
+
+// Datatype of the nodes of the linked list of packets
+typedef struct pkt_node_t {
+  time_t timestamp;
+  fap_packet_t *packet;
+  struct pkt_node_t *next;
+} pkt_node_t;
+
+// Threads data structures
+typedef struct thr_data_t {
+  int sockfd; // aprsc socket
+  pkt_node_t *pkt_list; // packets list
+  mtx_t list_mutex; // packets list muted
+  bool duplicates; // this thread parses duplicates
+} thr_data_t;
+                
+// Enqueue new node at the end of the list
+void list_enqueue(pkt_node_t **head, fap_packet_t *packet) {
+  // Populate new node
+  pkt_node_t *node = (pkt_node_t *) malloc(sizeof(pkt_node_t));
+  node->timestamp = time(NULL);
+  node->packet = packet;
+  node->next = NULL;
+  // Empty list
+  if (*head == NULL) {
+    *head = node;
+    return;
+  }
+  // Traverse the list until the end
+  pkt_node_t *cur = NULL;
+  for(cur = *head; cur->next != NULL; cur = cur->next);
+  cur->next = node;
+}
+
+// Remove a packet from the head of the list
+fap_packet_t *list_dequeue(pkt_node_t **head) {
+  // Empty list
+  if (*head == NULL)
+    return 0;
+  fap_packet_t *packet = (*head)->packet;
+  pkt_node_t *old_head = *head;
+  *head = (*head)->next;
+  free(old_head);
+  return packet;
+}
+
+// Older than x seconds
+bool is_older(time_t ts, int x) {
+  return difftime(time(NULL), ts) > (double) x;
+}
+
+// Sweep the list and remove packets older than 30s, assume ordered list
+void list_cleanup(pkt_node_t **head) {
+  // Empty list
+  if (*head == NULL)
+    return;
+  // Delete until the current node is younger than 30s
+  for(pkt_node_t *cur = *head; cur->next != NULL && is_older(cur->timestamp, 30); cur = *head) {
+    pkt_node_t *old_head = cur;
+    *head = cur->next;
+    fap_free(old_head->packet);
+    free(old_head);
+  }
+}
+
+size_t list_size(pkt_node_t *head) {
+  // Empty list
+  if (head == NULL)
+    return 0;
+  size_t list_size = 0;
+  // Delete until the current node is younger than 30s
+  for(pkt_node_t *cur = head; cur->next != NULL; cur = cur->next)
+    list_size++;
+  return list_size;
 }
 
 toml_table_t *parse_settings() {
@@ -81,7 +157,7 @@ int open_socket(char *host, int port) {
   return sockfd;
 }
 
-int open_aprsc_conn(toml_table_t *conf) {
+int open_aprsc_conn(toml_table_t *conf, bool duplicates) {
   char buffer[BUFSIZ];
 
   toml_table_t* aprsc_conf = toml_table_in(conf, "aprsc");
@@ -92,33 +168,49 @@ int open_aprsc_conn(toml_table_t *conf) {
   if (!aprsc_host.ok) {
       error("cannot read aprsc.host", "");
   }
-  toml_datum_t aprsc_port = toml_int_in(aprsc_conf, "port");
+  toml_datum_t aprsc_port;
+  if (!duplicates)
+     aprsc_port = toml_int_in(aprsc_conf, "port");
+  else
+     aprsc_port = toml_int_in(aprsc_conf, "dup_port");
   if (!aprsc_port.ok) {
       error("cannot read aprsc.port", "");
   }
-  toml_datum_t aprsc_user = toml_string_in(aprsc_conf, "user");
+  toml_datum_t aprsc_user;
+  if (!duplicates)
+    aprsc_user = toml_string_in(aprsc_conf, "user");
+  else
+    aprsc_user = toml_string_in(aprsc_conf, "dup_user");
   if (!aprsc_user.ok) {
       error("cannot read aprsc.user", "");
   }
-  toml_datum_t aprsc_password = toml_string_in(aprsc_conf, "password");
+  toml_datum_t aprsc_password;
+  if (!duplicates)
+    aprsc_password = toml_string_in(aprsc_conf, "password");
+  else
+    aprsc_password = toml_string_in(aprsc_conf, "dup_password");
   if (!aprsc_host.ok) {
       error("cannot read aprsc.password", "");
   }
 
-  // Open socket to APRSC
+  // Open socket
   int sockfd = open_socket(aprsc_host.u.s, aprsc_port.u.i);
 
   // Authenticate to aprsc
   char auth_str[AUTH_STR_LEN] = { 0 };
-  snprintf(auth_str, AUTH_STR_LEN, "user %s pass %s vers aprs_analytics0.1\n", aprsc_user.u.s, aprsc_password.u.s);
+  snprintf(auth_str,
+           AUTH_STR_LEN,
+           "user %s pass %s vers aprs_analytics0.1\n",
+           aprsc_user.u.s,
+           aprsc_password.u.s);
   size_t auth_str_len = strnlen(auth_str, AUTH_STR_LEN);
   write(sockfd, auth_str, auth_str_len);
   // Receive aprsc version
-  read(sockfd, buffer, BUFSIZ);
-  puts(buffer);
+  int n_read = read(sockfd, buffer, BUFSIZ);
+  printf("%.*s", n_read, buffer);
   // Receive login response
-  read(sockfd, buffer, BUFSIZ);
-  puts(buffer);
+  n_read = read(sockfd, buffer, BUFSIZ);
+  printf("%.*s", n_read, buffer);
 
   free(aprsc_host.u.s);
   free(aprsc_user.u.s);
@@ -169,7 +261,14 @@ PGconn *open_db_conn(toml_table_t *conf) {
   }
 
   // This string defines the database to be opened
-  snprintf(conninfo, CONNINFO_LEN, "host=%s port=%d dbname=%s user=%s password=%s", db_host.u.s, db_port.u.i, db_database.u.s, db_user.u.s, db_password.u.s);
+  snprintf(conninfo,
+           CONNINFO_LEN,
+           "host=%s port=%d dbname=%s user=%s password=%s",
+           db_host.u.s,
+           db_port.u.i,
+           db_database.u.s,
+           db_user.u.s,
+           db_password.u.s);
 
   /* Make a connection to the database */
   conn = PQconnectdb(conninfo);
@@ -194,7 +293,6 @@ const char insert_station_cmd[] = "INSERT INTO stations (callsign) "
                                   "WHERE NOT EXISTS (SELECT 1 "
                                                     "FROM stations "
                                                     "WHERE callsign = $1::varchar);";
-*/
 const char insert_station_cmd[] = "WITH input_data(callsing_in, latitude_in, longitude_in) AS ("
           " SELECT $1::varchar, $2::real, $3::real"
           "), "
@@ -213,6 +311,14 @@ const char insert_station_cmd[] = "WITH input_data(callsing_in, latitude_in, lon
           "INSERT INTO payloads (station_id, message, ts_message, position_id)"
                                   " SELECT s2.stationid, $4::varchar, NOW(), s3.gid "
                                   " FROM input_data s1, station_insert s2, position_insert s3;";
+*/
+const char insert_station_cmd[] = "CALL sp_insert_station("
+                                  "    callsign_in => $1::character varying,"
+                                  "    latitude_in => $2::real,"
+                                  "   longitude_in => $3::real,"
+                                  "     message_in => $4::character varying,"
+                                  "      symbol_in => $5::smallint"
+                                  ");";
 
 // Log an APRS packet into the DB
 void log_packet(fap_packet_t *packet, PGconn *conn) {
@@ -235,7 +341,7 @@ void log_packet(fap_packet_t *packet, PGconn *conn) {
     char packet_symbol[10];
     snprintf(packet_symbol, 10, "%d\n", packet->symbol_table*256 + packet->symbol_code - 32768);
 
-    printf("packet_symbol = %s", packet_symbol);
+    // printf("packet_symbol = %s", packet_symbol);
 
     const char *paramValues[5] = { packet->src_callsign, packet_latitude, packet_longitude, packet->comment, packet_symbol };
 
@@ -250,8 +356,8 @@ void log_packet(fap_packet_t *packet, PGconn *conn) {
   }
 }
 
-// Parse APRS packet using libfap
-void parse_packet(char *buf, int len, PGconn *conn) {
+// Parse APRS packet using libfap, and enqueue into a queue
+fap_packet_t *parse_enqueue_packet(char *buf, int len, thr_data_t *thr_data) {
   fap_packet_t* packet = fap_parseaprs(buf, len, 0);
   if ( packet->error_code )
   {
@@ -261,61 +367,153 @@ void parse_packet(char *buf, int len, PGconn *conn) {
   }
   else
   {
-    log_packet(packet, conn);
+    mtx_lock(&(thr_data->list_mutex));
+    list_enqueue(&(thr_data->pkt_list), packet);
+    mtx_unlock(&(thr_data->list_mutex));
   }
-  fap_free(packet);
+  return packet;
 }
 
-int main(int argc, char *argv[])
-{
+void *packets_thread(void *thr_data_ptr) {
   char buffer[BUFSIZ];
   int n_read = 0;
   int tot_read = 0;
-
-  toml_table_t *conf = parse_settings();
-
-  // Initialize APRS Parser
-  fap_init();
-
-  // Open connection to DB
-  PGconn *conn = open_db_conn(conf);
+  thr_data_t *thr_data = (thr_data_t *) thr_data_ptr;
+  PGconn *conn;
 
   // Connect to APRSC server
-  int sockfd = open_aprsc_conn(conf);
+  toml_table_t *conf = parse_settings();
+  toml_table_t* aprsc_conf = toml_table_in(conf, "aprsc");
+  if (!aprsc_conf) {
+      error("missing [aprsc]", "");
+  }
 
-  // Main loop for getting and parsing APRS packets
+  // Thread 0 needs connection to DB
+  if (!thr_data->duplicates)
+    conn = open_db_conn(conf);
+
   while (1) {
     // Receive a chunk of data
-    n_read = read(sockfd, buffer + tot_read, BUFSIZ - tot_read);
+    n_read = read(thr_data->sockfd, buffer + tot_read, BUFSIZ - tot_read);
     tot_read += n_read;
 
     // For each line, process an APRS packet
     for(int i = 0; i < tot_read; i++) {
       if (buffer[i] == '\r' || buffer[i] == '\n') {
         buffer[i] = '\0';
-        printf("\nRCVD: %s", buffer);
+        if (!thr_data->duplicates)
+          printf("\nRCVD: %s", buffer);
+        else
+          printf("\nDUP: %s", buffer);
         if (buffer[0] == '#')
         {
           tot_read = 0;
           continue;
         }
-        parse_packet(buffer, i+1, conn);
+        // If not duplicate enqueue and upload
+        if (!thr_data->duplicates) {
+          fap_packet_t *packet = parse_enqueue_packet(buffer, i+1, thr_data);
+          log_packet(packet, conn);
+        // Otherwise just enqueue
+        } else {
+          // Strip leading dup and whitespaces
+          int j = 3;
+          for(; j < tot_read && (buffer[j] < 'A' || buffer[j] > 'Z'); j++);
+          parse_enqueue_packet(buffer + j, i+1, thr_data);
+        }
         tot_read = 0;
       }
     }
   }
+  close(thr_data->sockfd);
 
   // Close FAP
   fap_cleanup();
 
-  // Close socket
-  close(sockfd);
+  // Free toml config memory
+  toml_free(conf);
+
+  thrd_exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char *argv[])
+{
+  bool print_stats = true;
+  thrd_t packets_thrd, duplicates_thread;
+
+  // Initialize APRS Parser
+  fap_init();
+
+  // Parse config file
+  toml_table_t *conf = parse_settings();
+
+  // Open connection to DB
+  PGconn *conn = open_db_conn(conf);
+
+  // Initialize threads data structures, thr 0: packets, thr 1: duplicates
+  thr_data_t thr_data[2] = { 0 };
+  thr_data[0].sockfd = open_aprsc_conn(conf, false);
+  int ret = mtx_init(&(thr_data[0].list_mutex), mtx_plain);
+  thr_data[1].sockfd = open_aprsc_conn(conf, true);
+  ret = mtx_init(&(thr_data[1].list_mutex), mtx_plain);
+  thr_data[1].duplicates = true;
+
+  // Start thread to fetch APRS packets
+  for(long i = 0; i < 2; i++) {
+    ret = thrd_create(&packets_thrd, (thrd_start_t)packets_thread, (void *)&(thr_data[i]));
+    if (ret == thrd_error) {
+      printf("ERORR; thrd_create() call failed for thread %d\n", i);
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  // Main loop for matching packets and duplicates and logging to the db
+  while (1) {
+    // Fetch from duplicates queue
+    mtx_lock(&(thr_data[1].list_mutex));
+    fap_packet_t *packet = list_dequeue(&(thr_data[1].pkt_list));
+    mtx_unlock(&(thr_data[1].list_mutex));
+    // If list is empty packet is equal to 0, if no packet in main list, skip
+    if (packet != 0 && thr_data[0].pkt_list != NULL) {
+      // Try to match main packets queue
+      mtx_lock(&(thr_data[0].list_mutex));
+      for(pkt_node_t *cur = thr_data[0].pkt_list; cur->next != NULL; cur = cur->next) {
+        // If source callsign and comment match
+        if(!strcmp(packet->src_callsign, cur->packet->src_callsign)) {
+          // printf("Matching:\n[%s]==[%s]\n[%s]==[%s]\n",
+          //        packet->src_callsign,
+          //        cur->packet->src_callsign,
+          //        packet->comment,
+          //        cur->packet->comment);
+          if (packet->comment && cur->packet->comment &&
+              !strcmp(packet->comment, cur->packet->comment)) {
+            printf("\nGot a match for duplicate:\n%s> %s\n",
+                   packet->src_callsign,
+                   packet->comment);
+            // TODO: Upload duplicate packet to DB
+            break;
+          }
+        }
+      }
+      mtx_unlock(&(thr_data[0].list_mutex));
+    }
+    // Sweep main list to remove packets older than 30s
+    mtx_lock(&(thr_data[0].list_mutex));
+    list_cleanup(&(thr_data[0].pkt_list));
+    mtx_unlock(&(thr_data[0].list_mutex));
+    // Statistics
+    if (!(time(NULL) % 10)) {
+      if (print_stats) {
+        printf("\nThe main list contains %d packets\n", list_size(thr_data[0].pkt_list));
+        printf("The duplicates list contains %d packets\n", list_size(thr_data[1].pkt_list));
+      }
+      print_stats = false;
+    } else
+      print_stats = true;
+  }
 
   // Close DB
   exit_nicely(conn);
 
-  // Free toml config memory
-  toml_free(conf);
-
-  return 0;
+  thrd_exit(EXIT_SUCCESS);
 }

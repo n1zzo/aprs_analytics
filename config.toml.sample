@@ -1,8 +1,11 @@
 [aprsc]
 	host = "APRSC_HOSTNAME"
 	port = 14580
-    user = "USER"
-    password = "PASSWORD"
+  user = "USER"
+  password = "PASSWORD"
+	dup_port = 14583
+  dup_user = "USER"
+  dup_password = "PASSWORD"
 
 [db]
     host = "DB_HOSTNAME"
