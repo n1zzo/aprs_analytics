@@ -1,4 +1,4 @@
-CFLAGS:= -g -O0 -fsanitize=address
+# CFLAGS:= -g -O0 -fsanitize=address
 
 all: aprs_analytics
 
