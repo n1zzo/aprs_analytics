@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fap.h>
@@ -17,17 +18,14 @@
 #define AUTH_STR_LEN 256
 #define ERR_STR_LEN 256
 #define CONNINFO_LEN 256
-
-static void error(const char* msg, const char* msg1)
-{
-  fprintf(stderr, "Error: %s%s\n", msg, msg1?msg1:"");
-  exit(1);
-}
+#define MAX_DUP 32
 
 // Datatype of the nodes of the linked list of packets
 typedef struct pkt_node_t {
   time_t timestamp;
   fap_packet_t *packet;
+  size_t dup_count;
+  fap_packet_t *duplicates[MAX_DUP];
   struct pkt_node_t *next;
 } pkt_node_t;
 
@@ -38,13 +36,68 @@ typedef struct thr_data_t {
   mtx_t list_mutex; // packets list muted
   bool duplicates; // this thread parses duplicates
 } thr_data_t;
-                
+
+static void error(const char* msg, const char* msg1)
+{
+  fprintf(stderr, "Error: %s%s\n", msg, msg1?msg1:"");
+  exit(1);
+}
+
+const char insert_station_cmd[] = "CALL sp_insert_station("
+                                  "    callsign_in => $1::character varying,"
+                                  "    latitude_in => $2::real,"
+                                  "   longitude_in => $3::real,"
+                                  "     message_in => $4::character varying,"
+                                  "      symbol_in => $5::smallint"
+                                  ");";
+
+// Log an APRS packet into the DB
+void log_packet(fap_packet_t *packet, PGconn *conn) {
+  // Log any station that sends a location packet
+  if ( packet->src_callsign && packet->latitude && packet->longitude)
+  {
+/*
+    printf("\nGot geo packet from %s <%lf,%lf>.\nSymb tbl %d code %d -> %d\n",
+           packet->src_callsign,
+           *(packet->latitude),
+           *(packet->longitude),
+           packet->symbol_table,
+           packet->symbol_code,
+           packet->symbol_table*256 + packet->symbol_code - 32768);
+*/
+    char packet_latitude[10];
+    snprintf(packet_latitude, 10, "%.5lf\n", *(packet->latitude));
+    char packet_longitude[10];
+    snprintf(packet_longitude, 10, "%.5lf\n", *(packet->longitude));
+    char packet_symbol[10];
+    snprintf(packet_symbol, 10, "%d\n", packet->symbol_table*256 + packet->symbol_code - 32768);
+
+    // printf("packet_symbol = %s", packet_symbol);
+
+    const char *paramValues[5] = { packet->src_callsign, packet_latitude, packet_longitude, packet->comment, packet_symbol };
+
+    int resultFormat = 0;
+
+    PGresult *res = PQexecParams(conn, insert_station_cmd, 5, NULL, paramValues, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      printf("PQexecParames failed: %s\n", PQresultErrorMessage(res));
+    }
+    // Should PQclear PGresult whenever it is no longer needed to avoid memory leaks
+    PQclear(res);
+  }
+}
+
+void log_heardby(pkt_node_t *node, PGconn *conn) {
+    // TODO: Populate heardby table, duplicates are in node->duplicates[node->dup_count]
+}
+
 // Enqueue new node at the end of the list
 void list_enqueue(pkt_node_t **head, fap_packet_t *packet) {
   // Populate new node
   pkt_node_t *node = (pkt_node_t *) malloc(sizeof(pkt_node_t));
   node->timestamp = time(NULL);
   node->packet = packet;
+  node->dup_count = 0;
   node->next = NULL;
   // Empty list
   if (*head == NULL) {
@@ -86,6 +139,48 @@ void list_cleanup(pkt_node_t **head) {
     fap_free(old_head->packet);
     free(old_head);
   }
+}
+
+// Sweep the list and remove packets older than 30s, assume ordered list
+void list_cleanup_upload(pkt_node_t **head, PGconn *conn) {
+  // Empty list
+  if (*head == NULL)
+    return;
+  // Delete until the current node is younger than 30s
+  for(pkt_node_t *cur = *head; cur->next != NULL && is_older(cur->timestamp, 30); cur = *head) {
+    pkt_node_t *old_head = cur;
+    // Upload packets older than 30s
+    log_packet(old_head->packet, conn);
+    log_heardby(old_head, conn);
+    *head = cur->next;
+    fap_free(old_head->packet);
+    free(old_head);
+  }
+}
+
+// Remove a node from the list, do not free its packet, return the node before the one to be deleted
+pkt_node_t *remove_node(pkt_node_t **head, pkt_node_t *to_remove) {
+  // Empty list
+  if (*head == NULL)
+    return NULL;
+  // Node to delete is first
+  if (*head == to_remove) {
+    free(*head);
+    *head = NULL;
+    return NULL;
+  }
+  // Iterate until the next node is the one to delete
+  pkt_node_t *cur;
+  for(cur = *head; cur->next != NULL && cur->next != to_remove; cur = cur->next);
+  // Node not found!
+  if (cur->next == NULL)
+    return NULL;
+  else {
+    pkt_node_t *old_next = cur->next;
+    cur->next = cur->next->next;
+    free(old_next);
+  }
+  return cur;
 }
 
 size_t list_size(pkt_node_t *head) {
@@ -287,74 +382,6 @@ PGconn *open_db_conn(toml_table_t *conf) {
 
   return conn;
 }
-/*
-const char insert_station_cmd[] = "INSERT INTO stations (callsign) "
-                                  "SELECT ($1::varchar) "
-                                  "WHERE NOT EXISTS (SELECT 1 "
-                                                    "FROM stations "
-                                                    "WHERE callsign = $1::varchar);";
-const char insert_station_cmd[] = "WITH input_data(callsing_in, latitude_in, longitude_in) AS ("
-          " SELECT $1::varchar, $2::real, $3::real"
-          "), "
-          "station_insert AS ("
-                                  " INSERT INTO stations (callsign, symbol) "
-                                  " VALUES ($1::varchar, $5::smallint)"
-                                  " ON CONFLICT DO NOTHING"
-          " returning stationid"
-          "), "
-          "position_insert AS ("
-          " INSERT INTO positions (ts_start, point, ts_stop, station_id)"
-                                  " SELECT NOW(), ST_MakePoint(s1.longitude_in, s1.latitude_in), NOW(), s2.stationid "
-                                  " FROM input_data s1, station_insert s2"
-          " returning gid"
-          ") "
-          "INSERT INTO payloads (station_id, message, ts_message, position_id)"
-                                  " SELECT s2.stationid, $4::varchar, NOW(), s3.gid "
-                                  " FROM input_data s1, station_insert s2, position_insert s3;";
-*/
-const char insert_station_cmd[] = "CALL sp_insert_station("
-                                  "    callsign_in => $1::character varying,"
-                                  "    latitude_in => $2::real,"
-                                  "   longitude_in => $3::real,"
-                                  "     message_in => $4::character varying,"
-                                  "      symbol_in => $5::smallint"
-                                  ");";
-
-// Log an APRS packet into the DB
-void log_packet(fap_packet_t *packet, PGconn *conn) {
-  // Log any station that sends a location packet
-  if ( packet->src_callsign && packet->latitude && packet->longitude)
-  {
-/*
-    printf("\nGot geo packet from %s <%lf,%lf>.\nSymb tbl %d code %d -> %d\n",
-           packet->src_callsign,
-           *(packet->latitude),
-           *(packet->longitude),
-           packet->symbol_table,
-           packet->symbol_code,
-           packet->symbol_table*256 + packet->symbol_code - 32768);
-*/
-    char packet_latitude[10];
-    snprintf(packet_latitude, 10, "%.5lf\n", *(packet->latitude));
-    char packet_longitude[10];
-    snprintf(packet_longitude, 10, "%.5lf\n", *(packet->longitude));
-    char packet_symbol[10];
-    snprintf(packet_symbol, 10, "%d\n", packet->symbol_table*256 + packet->symbol_code - 32768);
-
-    // printf("packet_symbol = %s", packet_symbol);
-
-    const char *paramValues[5] = { packet->src_callsign, packet_latitude, packet_longitude, packet->comment, packet_symbol };
-
-    int resultFormat = 0;
-
-    PGresult *res = PQexecParams(conn, insert_station_cmd, 5, NULL, paramValues, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-      printf("PQexecParames failed: %s\n", PQresultErrorMessage(res));
-    }
-    // Should PQclear PGresult whenever it is no longer needed to avoid memory leaks
-    PQclear(res);
-  }
-}
 
 // Parse APRS packet using libfap, and enqueue into a queue
 fap_packet_t *parse_enqueue_packet(char *buf, int len, thr_data_t *thr_data) {
@@ -410,11 +437,8 @@ void *packets_thread(void *thr_data_ptr) {
           tot_read = 0;
           continue;
         }
-        // If not duplicate enqueue and upload
         if (!thr_data->duplicates) {
-          fap_packet_t *packet = parse_enqueue_packet(buffer, i+1, thr_data);
-          log_packet(packet, conn);
-        // Otherwise just enqueue
+          parse_enqueue_packet(buffer, i+1, thr_data);
         } else {
           // Strip leading dup and whitespaces
           int j = 3;
@@ -469,38 +493,43 @@ int main(int argc, char *argv[])
 
   // Main loop for matching packets and duplicates and logging to the db
   while (1) {
-    // Fetch from duplicates queue
+    // Iterate over duplicates queue
+    mtx_lock(&(thr_data[0].list_mutex));
     mtx_lock(&(thr_data[1].list_mutex));
-    fap_packet_t *packet = list_dequeue(&(thr_data[1].pkt_list));
-    mtx_unlock(&(thr_data[1].list_mutex));
-    // If list is empty packet is equal to 0, if no packet in main list, skip
-    if (packet != 0 && thr_data[0].pkt_list != NULL) {
-      // Try to match main packets queue
-      mtx_lock(&(thr_data[0].list_mutex));
-      for(pkt_node_t *cur = thr_data[0].pkt_list; cur->next != NULL; cur = cur->next) {
-        // If source callsign and comment match
-        if(!strcmp(packet->src_callsign, cur->packet->src_callsign)) {
-          // printf("Matching:\n[%s]==[%s]\n[%s]==[%s]\n",
-          //        packet->src_callsign,
-          //        cur->packet->src_callsign,
-          //        packet->comment,
-          //        cur->packet->comment);
-          if (packet->comment && cur->packet->comment &&
-              !strcmp(packet->comment, cur->packet->comment)) {
-            printf("\nGot a match for duplicate:\n%s> %s\n",
-                   packet->src_callsign,
-                   packet->comment);
-            // TODO: Upload duplicate packet to DB
-            break;
+    // If both lists are not empty
+    if (thr_data[0].pkt_list && thr_data[1].pkt_list) {
+      // Iterate over duplicates list, handle the case where the current node might be deleted
+      for(pkt_node_t *dup = thr_data[1].pkt_list; dup != NULL && dup->next != NULL; dup = dup ? dup->next : NULL) {
+        // Try to match main packets queue
+        for(pkt_node_t *cur = thr_data[0].pkt_list; cur->next != NULL; cur = cur->next) {
+          // If source callsign and comment match
+          if(!strcmp(dup->packet->src_callsign, cur->packet->src_callsign)) {
+            if (dup->packet->comment && cur->packet->comment &&
+                !strcmp(dup->packet->comment, cur->packet->comment)) {
+              printf("\nGot a match for duplicate:\n%s> %s\n",
+                     dup->packet->src_callsign,
+                     dup->packet->comment);
+              // Assign duplicate to main packet
+              assert(cur->dup_count < MAX_DUP - 1);
+              cur->duplicates[++cur->dup_count] = dup->packet;
+              // Remove duplicate from duplicates list
+              dup = remove_node(&(thr_data[1].pkt_list), dup);
+              break;
+            }
           }
         }
       }
-      mtx_unlock(&(thr_data[0].list_mutex));
     }
+    mtx_unlock(&(thr_data[0].list_mutex));
+    mtx_unlock(&(thr_data[1].list_mutex));
     // Sweep main list to remove packets older than 30s
     mtx_lock(&(thr_data[0].list_mutex));
-    list_cleanup(&(thr_data[0].pkt_list));
+    list_cleanup_upload(&(thr_data[0].pkt_list), conn);
     mtx_unlock(&(thr_data[0].list_mutex));
+    // Delete older duplicates
+    mtx_lock(&(thr_data[1].list_mutex));
+    list_cleanup(&(thr_data[1].pkt_list));
+    mtx_unlock(&(thr_data[1].list_mutex));
     // Statistics
     if (!(time(NULL) % 10)) {
       if (print_stats) {
