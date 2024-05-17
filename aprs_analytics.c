@@ -18,7 +18,10 @@
 #define AUTH_STR_LEN 256
 #define ERR_STR_LEN 256
 #define CONNINFO_LEN 256
-#define MAX_DUP 32
+#define MAX_DUP 64
+
+// Thread condition that signals a new packet received
+cnd_t packet_recv;
 
 // Datatype of the nodes of the linked list of packets
 typedef struct pkt_node_t {
@@ -445,6 +448,7 @@ void *packets_thread(void *thr_data_ptr) {
           for(; j < tot_read && (buffer[j] < 'A' || buffer[j] > 'Z'); j++);
           parse_enqueue_packet(buffer + j, i+1, thr_data);
         }
+        cnd_signal(&packet_recv);
         tot_read = 0;
       }
     }
@@ -493,9 +497,11 @@ int main(int argc, char *argv[])
 
   // Main loop for matching packets and duplicates and logging to the db
   while (1) {
-    // Iterate over duplicates queue
     mtx_lock(&(thr_data[0].list_mutex));
     mtx_lock(&(thr_data[1].list_mutex));
+    // Sleep until a packet arrives
+    cnd_wait(&packet_recv, &(thr_data[0].list_mutex));
+    // Iterate over duplicates queue
     // If both lists are not empty
     if (thr_data[0].pkt_list && thr_data[1].pkt_list) {
       // Iterate over duplicates list, handle the case where the current node might be deleted
